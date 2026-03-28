@@ -1,11 +1,11 @@
 permissions:
   actions: none
   checks: none
-  contents: write          # required for GitHub Release creation
+  contents: write
   deployments: none
   issues: write
   packages: none
-  pull-requests: write     # required for create-pull-request action
+  pull-requests: write
   repository-projects: none
   security-events: none
   statuses: none
@@ -35,7 +35,6 @@ env:
 name: Builds and pushes tagged image to DockerHub
 
 jobs:
-  # ── Job 1: Build/push dependency Docker images ───────────────────────────────
   generate_build_deps:
     name: Generate Build Deps
     runs-on: ${{ fromJSON(format('["ubuntu-latest", "{0}"]', github.event.inputs.type))[github.event.inputs.type != ''] }}
@@ -55,8 +54,7 @@ jobs:
             /usr/local/share/chromium /usr/lib/gcc; do
             test -d "$DIR" && sudo rm -rf "$DIR" || true
           done
-          for DIR in /usr/local/llvm-* /usr/lib/llvm-* /usr/local/julia* \
-                     /usr/share/az_*; do
+          for DIR in /usr/local/llvm-* /usr/lib/llvm-* /usr/local/julia* /usr/share/az_*; do
             sudo rm -rf $DIR 2>/dev/null || true
           done
           sudo apt-get remove -y \
@@ -77,13 +75,13 @@ jobs:
           fi
 
       - name: Checkout repo
-        uses: actions/checkout@v4          # upgraded from v2
+        uses: actions/checkout@v4
         with:
           path: cromite
           fetch-depth: 1
 
       - name: Login to Docker Hub
-        uses: docker/login-action@v3       # upgraded from v2
+        uses: docker/login-action@v3
         with:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
@@ -101,15 +99,13 @@ jobs:
               'https://versionhistory.googleapis.com/v1/chrome/platforms/android/channels/stable/versions/all/releases' \
               | jq -rc '.releases[].version' \
               | sort -t. -k1,1n -k2,2n -k3,3n -k4,4n | tail -n1)
-            CHR_VERSION=$(printf '%s
-%s
-' "$LATEST_ANDROID" "$LATEST_WIN" \
+            CHR_VERSION=$(echo -e "${LATEST_ANDROID}
+${LATEST_WIN}" \
               | sort -t. -k1,1n -k2,2n -k3,3n -k4,4n | tail -n1)
-            echo "LATEST_WIN=$LATEST_WIN"     >> $GITHUB_ENV
+            echo "LATEST_WIN=$LATEST_WIN"         >> $GITHUB_ENV
             echo "LATEST_ANDROID=$LATEST_ANDROID" >> $GITHUB_ENV
-            echo "CHR_VERSION=$CHR_VERSION"   >> $GITHUB_ENV
+            echo "CHR_VERSION=$CHR_VERSION"       >> $GITHUB_ENV
           fi
-          # expose for downstream jobs
           echo "chr_version=$CHR_VERSION" >> $GITHUB_OUTPUT
 
       - name: Download regctl
@@ -154,11 +150,10 @@ jobs:
         if: env.NEW_VERSION != ''
         shell: bash
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}   # use env var; avoids echoing secret
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           cd cromite/tools
 
-          # Build body — use >> after first write to avoid overwriting
           echo "Custom Release $CHR_VERSION" > body.txt
 
           if [[ "$LATEST_WIN" == "$CHR_VERSION" ]]; then
@@ -198,7 +193,6 @@ jobs:
             NEW_VERSION=$RELEASE
           fi
 
-          # BUG FIX: was [[ DO_UPDATE -eq 1 ]] — missing $ made this never true
           if [[ $DO_UPDATE -eq 1 ]]; then
             echo "Found new version $NEW_VERSION"
             test -d src && rm -rf src
@@ -209,7 +203,6 @@ jobs:
           CHANGES=0
           git diff --quiet || CHANGES=1
           echo "CHANGES=$CHANGES" >> $GITHUB_ENV
-          # BUG FIX: was [[ CHANGES -eq 1 ]] — missing $ made this never true
           if [[ $CHANGES -eq 1 ]]; then
             git add src
             git diff --name-only --staged
@@ -232,16 +225,12 @@ jobs:
         id: new_ver
         run: echo "new_version=${{ env.NEW_VERSION }}" >> $GITHUB_OUTPUT
 
-  # ── Job 2: Build Cromite binaries ────────────────────────────────────────────
   build_cromite:
     name: Build Cromite (${{ matrix.target }})
     needs: generate_build_deps
-    # run when: a new version was detected, OR build was manually requested
-    if: |
-      needs.generate_build_deps.outputs.new_version != '' ||
-      github.event.inputs.build == 'true'
+    if: ${{ needs.generate_build_deps.outputs.new_version != '' || github.event.inputs.build == 'true' }}
     runs-on: ${{ fromJSON(format('["ubuntu-latest", "{0}"]', github.event.inputs.type))[github.event.inputs.type != ''] }}
-    timeout-minutes: 350      # chromium builds take 3–6 h; stay under the 6 h limit
+    timeout-minutes: 350
 
     strategy:
       fail-fast: false
@@ -268,8 +257,7 @@ jobs:
             /usr/local/share/chromium /usr/lib/gcc; do
             test -d "$DIR" && sudo rm -rf "$DIR" || true
           done
-          for DIR in /usr/local/llvm-* /usr/lib/llvm-* /usr/local/julia* \
-                     /usr/share/az_*; do
+          for DIR in /usr/local/llvm-* /usr/lib/llvm-* /usr/local/julia* /usr/share/az_*; do
             sudo rm -rf $DIR 2>/dev/null || true
           done
           sudo apt-get remove -y \
@@ -297,9 +285,7 @@ jobs:
           CHR_VERSION: ${{ needs.generate_build_deps.outputs.chr_version }}
         run: |
           SHA=$(cd cromite && git rev-parse --short HEAD)
-          # cromite-build images are tagged VERSION-COMMITSHA per the release notes
           IMAGE="uazo/cromite-build:${CHR_VERSION}-${SHA}"
-          # fall back to build-deps if a pre-built source image doesn't exist yet
           docker pull "$IMAGE" 2>/dev/null \
             || IMAGE="uazo/build-deps:${CHR_VERSION}"
           echo "image=$IMAGE" >> $GITHUB_OUTPUT
