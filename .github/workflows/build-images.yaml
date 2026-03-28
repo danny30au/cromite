@@ -1,11 +1,11 @@
 permissions:
   actions: none
   checks: none
-  contents: none
+  contents: write          # required for GitHub Release creation
   deployments: none
   issues: write
   packages: none
-  pull-requests: none
+  pull-requests: write     # required for create-pull-request action
   repository-projects: none
   security-events: none
   statuses: none
@@ -18,62 +18,58 @@ on:
         required: false
         default: ''
       type:
-        description: 'runner?'
+        description: 'runner label (leave blank for ubuntu-latest)'
         required: false
-        default: 'ubuntu-latest'
+        default: ''
+      build:
+        description: 'run cromite build after deps? (true/false)'
+        required: false
+        default: 'false'
   schedule:
-   - cron: '0 1 * * *'
+    - cron: '0 1 * * *'
 
 env:
   CHR_VERSION: ${{ github.event.inputs.version }}
-  NEW_VERSION: ${{ null }}
+  NEW_VERSION: ''
 
 name: Builds and pushes tagged image to DockerHub
+
 jobs:
+  # ── Job 1: Build/push dependency Docker images ───────────────────────────────
   generate_build_deps:
     name: Generate Build Deps
-    runs-on: ${{ fromJSON( format('["ubuntu-latest", "{0}"]', github.event.inputs.type) )[github.event.inputs.type != ''] }}
+    runs-on: ${{ fromJSON(format('["ubuntu-latest", "{0}"]', github.event.inputs.type))[github.event.inputs.type != ''] }}
+    outputs:
+      chr_version: ${{ steps.versions.outputs.chr_version }}
+      new_version: ${{ steps.new_ver.outputs.new_version }}
+
     steps:
-      - name: Reclaiming disk space on / by removing dotnet/android/ghc
-        #if: ${{ github.event.inputs.type == '' }}
+      - name: Reclaim disk space on runner
         run: |
           df -h
-
-          DIR=/usr/share/dotnet && sudo rm -rf $DIR
-          DIR=/usr/local/lib/android && sudo rm -rf $DIR
-          DIR=/opt/ghc && sudo rm -rf $DIR
-          DIR=/opt/hostedtoolcache/CodeQL && sudo rm -rf $DIR
-          DIR=/usr/local/.ghcup && sudo rm -rf $DIR
-          DIR=/usr/lib/jvm && test -d $DIR && sudo rm -rf $DIR
-          DIR=/usr/local/julia1.10.5 && test -d $DIR && sudo rm -rf $DIR
-          DIR=/usr/local/x86_64-linux-gnu && test -d $DIR && sudo rm -rf $DIR
-          DIR=/usr/local/gcc && test -d $DIR && sudo rm -rf $DIR
-          DIR=/usr/local/llvm-15 && test -d $DIR && sudo rm -rf $DIR
-          DIR=/usr/local/llvm-14 && test -d $DIR && sudo rm -rf $DIR
-          DIR=/usr/local/llvm-13 && test -d $DIR && sudo rm -rf $DIR
-          DIR=/usr/local/heroku && test -d $DIR && sudo rm -rf $DIR
-          DIR=/usr/share/swift && test -d $DIR && sudo rm -rf $DIR
-          DIR=/usr/share/miniconda && test -d $DIR && sudo rm -rf $DIR
-          DIR=/usr/share/az_12.1.0 && test -d $DIR && sudo rm -rf $DIR
-          DIR=/usr/local/share/powershell && test -d $DIR && sudo rm -rf $DIR
-          DIR=/usr/local/share/chromium && test -d $DIR && sudo rm -rf $DIR
-          DIR=/usr/lib/gcc && test -d $DIR && sudo rm -rf $DIR
-          DIR=/usr/lib/llvm-15 && test -d $DIR && sudo rm -rf $DIR
-          DIR=/usr/lib/llvm-14 && test -d $DIR && sudo rm -rf $DIR
-          DIR=/usr/lib/llvm-13 && test -d $DIR && sudo rm -rf $DIR
-
-          sudo apt-get remove google-cloud-cli azure-cli google-chrome-stable \
-                       firefox mysql-server-core-8.0 mono-devel podman \
-                       powershell || true
-          sudo apt-get autoremove
-
+          for DIR in \
+            /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+            /opt/hostedtoolcache/CodeQL /usr/local/.ghcup /usr/lib/jvm \
+            /usr/local/x86_64-linux-gnu /usr/local/gcc /usr/local/heroku \
+            /usr/share/swift /usr/share/miniconda /usr/local/share/powershell \
+            /usr/local/share/chromium /usr/lib/gcc; do
+            test -d "$DIR" && sudo rm -rf "$DIR" || true
+          done
+          for DIR in /usr/local/llvm-* /usr/lib/llvm-* /usr/local/julia* \
+                     /usr/share/az_*; do
+            sudo rm -rf $DIR 2>/dev/null || true
+          done
+          sudo apt-get remove -y \
+            google-cloud-cli azure-cli google-chrome-stable firefox \
+            mysql-server-core-8.0 mono-devel podman powershell || true
+          sudo apt-get autoremove -y
           df -h
 
-      - name: Enable proxy on container
+      - name: Enable proxy (self-hosted runners only)
         shell: bash
         if: ${{ github.event.inputs.type != '' && github.event.inputs.type != 'ubuntu-latest' }}
         run: |
-          if ! [[ -z "${HTTP_PROXY}" ]]; then
+          if [[ -n "${HTTP_PROXY}" ]]; then
             PROXY_ADDR=http://$(hostname -I | cut -d' ' -f1 | xargs):8118
             echo "PROXY_ADDR=$PROXY_ADDR" >> $GITHUB_ENV
             sudo iptables -D INPUT -p tcp -s localhost --dport 8118 -j ACCEPT
@@ -81,149 +77,279 @@ jobs:
           fi
 
       - name: Checkout repo
-        uses: actions/checkout@v2
+        uses: actions/checkout@v4          # upgraded from v2
         with:
           path: cromite
           fetch-depth: 1
 
       - name: Login to Docker Hub
-        uses: docker/login-action@v2
+        uses: docker/login-action@v3       # upgraded from v2
         with:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
 
       - name: Check versions
+        id: versions
         shell: bash
         run: |
-          if [ -z $CHR_VERSION ]; then
-            LATEST_WIN=$(curl -s 'https://versionhistory.googleapis.com/v1/chrome/platforms/win64/channels/stable/versions/all/releases'  | jq -rc '.releases[].version' | sort -t. -k 1,1n -k 2,2n -k 3,3n -k 4,4n | tail -n 1)
-            LATEST_ANDROID=$(curl -s 'https://versionhistory.googleapis.com/v1/chrome/platforms/android/channels/stable/versions/all/releases'  | jq -rc '.releases[].version' | sort -t. -k 1,1n -k 2,2n -k 3,3n -k 4,4n | tail -n 1)
-            CHR_VERSION=$(echo -e "$LATEST_ANDROID\n$LATEST_WIN" | sort -t. -k 1,1n -k 2,2n -k 3,3n -k 4,4n | tail -n 1)
-
-            echo "LATEST_WIN=$LATEST_WIN" >> $GITHUB_ENV
+          if [ -z "$CHR_VERSION" ]; then
+            LATEST_WIN=$(curl -s \
+              'https://versionhistory.googleapis.com/v1/chrome/platforms/win64/channels/stable/versions/all/releases' \
+              | jq -rc '.releases[].version' \
+              | sort -t. -k1,1n -k2,2n -k3,3n -k4,4n | tail -n1)
+            LATEST_ANDROID=$(curl -s \
+              'https://versionhistory.googleapis.com/v1/chrome/platforms/android/channels/stable/versions/all/releases' \
+              | jq -rc '.releases[].version' \
+              | sort -t. -k1,1n -k2,2n -k3,3n -k4,4n | tail -n1)
+            CHR_VERSION=$(printf '%s
+%s
+' "$LATEST_ANDROID" "$LATEST_WIN" \
+              | sort -t. -k1,1n -k2,2n -k3,3n -k4,4n | tail -n1)
+            echo "LATEST_WIN=$LATEST_WIN"     >> $GITHUB_ENV
             echo "LATEST_ANDROID=$LATEST_ANDROID" >> $GITHUB_ENV
-            echo "CHR_VERSION=$CHR_VERSION" >> $GITHUB_ENV
+            echo "CHR_VERSION=$CHR_VERSION"   >> $GITHUB_ENV
           fi
+          # expose for downstream jobs
+          echo "chr_version=$CHR_VERSION" >> $GITHUB_OUTPUT
 
       - name: Download regctl
         shell: bash
         run: |
-          curl -L https://github.com/regclient/regclient/releases/latest/download/regctl-linux-amd64 >regctl
+          curl -fsSL https://github.com/regclient/regclient/releases/latest/download/regctl-linux-amd64 \
+            -o regctl
           chmod 755 regctl
-      
-      - name: Building build-deps container ${{ env.VERSION }}
+
+      - name: Build uazo/build-deps:${{ env.CHR_VERSION }}
         shell: bash
         run: |
-          IS_PRESENT=$(docker inspect --type=image uazo/build-deps:$CHR_VERSION > /dev/null ; echo $?)
-          if [ $IS_PRESENT -ne "0" ]; then
-            IS_PRESENT=$(./regctl image inspect uazo/build-deps:$CHR_VERSION > /dev/null ; echo $?)
-            if [ $IS_PRESENT -ne "0" ]; then
-              DOCKER_BUILDKIT=1 docker build -t uazo/build-deps:$CHR_VERSION \
-                --progress plain \
-                --build-arg VERSION=$CHR_VERSION \
-                --build-arg HTTP_PROXY="$PROXY_ADDR" \
-                --no-cache \
-                cromite/tools/images/build-deps/.
-
-              docker push uazo/build-deps:$CHR_VERSION
-              echo "NEW_VERSION=$CHR_VERSION" >> $GITHUB_ENV
-            fi
+          IS_PRESENT=$(./regctl image inspect uazo/build-deps:$CHR_VERSION > /dev/null 2>&1; echo $?)
+          if [ "$IS_PRESENT" -ne "0" ]; then
+            DOCKER_BUILDKIT=1 docker build \
+              -t uazo/build-deps:$CHR_VERSION \
+              --progress plain \
+              --build-arg VERSION=$CHR_VERSION \
+              --build-arg HTTP_PROXY="$PROXY_ADDR" \
+              --no-cache \
+              cromite/tools/images/build-deps/.
+            docker push uazo/build-deps:$CHR_VERSION
+            echo "NEW_VERSION=$CHR_VERSION" >> $GITHUB_ENV
           fi
 
-      - name: Building chromium container ${{ env.VERSION }}
+      - name: Build uazo/chromium:${{ env.CHR_VERSION }}
         shell: bash
         run: |
-          IS_PRESENT=$(docker inspect --type=image uazo/chromium:$CHR_VERSION > /dev/null ; echo $?)
-          if [ $IS_PRESENT -ne "0" ]; then
-            IS_PRESENT=$(./regctl image inspect uazo/chromium:$CHR_VERSION > /dev/null ; echo $?)
-            if [ $IS_PRESENT -ne "0" ]; then
-              DOCKER_BUILDKIT=1 docker build -t uazo/chromium:$CHR_VERSION \
-                --progress plain \
-                --build-arg VERSION=$CHR_VERSION \
-                --build-arg HTTP_PROXY="$PROXY_ADDR" \
-                cromite/tools/images/chr-source/.
-
-              docker push uazo/chromium:$CHR_VERSION
-              echo "NEW_VERSION=$CHR_VERSION" >> $GITHUB_ENV
-            fi
+          IS_PRESENT=$(./regctl image inspect uazo/chromium:$CHR_VERSION > /dev/null 2>&1; echo $?)
+          if [ "$IS_PRESENT" -ne "0" ]; then
+            DOCKER_BUILDKIT=1 docker build \
+              -t uazo/chromium:$CHR_VERSION \
+              --progress plain \
+              --build-arg VERSION=$CHR_VERSION \
+              --build-arg HTTP_PROXY="$PROXY_ADDR" \
+              cromite/tools/images/chr-source/.
+            docker push uazo/chromium:$CHR_VERSION
+            echo "NEW_VERSION=$CHR_VERSION" >> $GITHUB_ENV
           fi
 
-      - name: Create issue ${{ env.VERSION }}
-        if: "${{ env.NEW_VERSION != '' }}"
+      - name: Create issue for new version
+        if: env.NEW_VERSION != ''
         shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}   # use env var; avoids echoing secret
         run: |
-          GH=../../gh_2.18.1_linux_amd64/bin/gh
-          wget https://github.com/cli/cli/releases/download/v2.18.1/gh_2.18.1_linux_amd64.tar.gz
-          tar xfz gh_2.18.1_linux_amd64.tar.gz
-
           cd cromite/tools
-          echo ${{ secrets.GITHUB_TOKEN }} | $GH auth login --with-token
 
-          echo Custom Release $CHR_VERSION >body.txt
+          # Build body — use >> after first write to avoid overwriting
+          echo "Custom Release $CHR_VERSION" > body.txt
 
           if [[ "$LATEST_WIN" == "$CHR_VERSION" ]]; then
-             echo Using Windows Release >body.txt
-             echo "\`\`\`" >>body.txt
-             curl -s 'https://chromiumdash.appspot.com/fetch_releases?channel=Stable&platform=Windows&num=10&offset=0' | \
-                 jq --arg LATEST "$LATEST_WIN" '.[] | select( .version == $LATEST )' >>body.txt
-             echo "\`\`\`" >>body.txt
+            echo "Using Windows Release" >> body.txt
+            printf '```
+' >> body.txt
+            curl -s 'https://chromiumdash.appspot.com/fetch_releases?channel=Stable&platform=Windows&num=10&offset=0' \
+              | jq --arg V "$LATEST_WIN" '.[] | select(.version == $V)' >> body.txt
+            printf '```
+' >> body.txt
+          elif [[ "$LATEST_ANDROID" == "$CHR_VERSION" ]]; then
+            echo "Using Android Release" >> body.txt
+            printf '```
+' >> body.txt
+            curl -s 'https://chromiumdash.appspot.com/fetch_releases?channel=Stable&platform=Android&num=10&offset=0' \
+              | jq --arg V "$LATEST_ANDROID" '.[] | select(.version == $V)' >> body.txt
+            printf '```
+' >> body.txt
           fi
 
-          if [[ "$LATEST_ANDROID" == "$CHR_VERSION" ]]; then
-             echo Using Android Release >body.txt
-             echo "\`\`\`" >>body.txt
-             curl -s 'https://chromiumdash.appspot.com/fetch_releases?channel=Stable&platform=Android&num=10&offset=0' | \
-                 jq --arg LATEST "$LATEST_ANDROID" '.[] | select( .version == $LATEST )' >>body.txt
-             echo "\`\`\`" >>body.txt
-          fi
-          $GH issue create -t "$CHR_VERSION: new chromium version" -F body.txt
+          gh issue create \
+            -t "$CHR_VERSION: new chromium version" \
+            -F body.txt
 
-      - name: Update files under control 
+      - name: Update files under control
         shell: bash
         run: |
           cd cromite
           RELEASE=$(cat build/RELEASE | xargs)
-
           cd tools/under-control
 
           DO_UPDATE=0
           if [ -n "$NEW_VERSION" ]; then
-            if [ "$RELEASE" != "$NEW_VERSION" ]; then
-              DO_UPDATE=1
-            fi
-
+            [ "$RELEASE" != "$NEW_VERSION" ] && DO_UPDATE=1
           elif [ "$RELEASE" != "$(cat src/RELEASE | xargs)" ]; then
             DO_UPDATE=1
             NEW_VERSION=$RELEASE
           fi
 
-          if [[ DO_UPDATE -eq 1 ]]; then
+          # BUG FIX: was [[ DO_UPDATE -eq 1 ]] — missing $ made this never true
+          if [[ $DO_UPDATE -eq 1 ]]; then
             echo "Found new version $NEW_VERSION"
-            echo "Under control: $(cat src/RELEASE | xargs)"
-            echo "Current: $RELEASE"
-
             test -d src && rm -rf src
             docker build --progress=plain --build-arg "TAG=$NEW_VERSION" -o . .
-            echo $NEW_VERSION >src/RELEASE
+            echo "$NEW_VERSION" > src/RELEASE
           fi
 
-          CHANGES=0 && git diff --quiet || CHANGES=1
+          CHANGES=0
+          git diff --quiet || CHANGES=1
           echo "CHANGES=$CHANGES" >> $GITHUB_ENV
-          if [[ CHANGES -eq 1 ]]; then
-              git add src
-              git diff --name-only --staged
+          # BUG FIX: was [[ CHANGES -eq 1 ]] — missing $ made this never true
+          if [[ $CHANGES -eq 1 ]]; then
+            git add src
+            git diff --name-only --staged
           fi
 
       - name: Create Pull Request
-        uses: peter-evans/create-pull-request@c5a7806660adbe173f04e3e038b0ccdcd758773c #v6.1.0
+        uses: peter-evans/create-pull-request@c5a7806660adbe173f04e3e038b0ccdcd758773c
         if: env.CHANGES == '1'
         with:
           token: ${{ secrets.CROMITE_PULLS }}
           path: cromite
-          add-paths: |
-            tools/under-control/*
+          add-paths: tools/under-control/*
           commit-message: '[AUTO][FILECONTROL] - version ${{ env.NEW_VERSION }}'
           title: '[AUTO][FILECONTROL] - version ${{ env.NEW_VERSION }}'
           body: ${{ env.MESSAGE }}
           delete-branch: true
           branch-suffix: short-commit-hash
+
+      - name: Expose new_version output
+        id: new_ver
+        run: echo "new_version=${{ env.NEW_VERSION }}" >> $GITHUB_OUTPUT
+
+  # ── Job 2: Build Cromite binaries ────────────────────────────────────────────
+  build_cromite:
+    name: Build Cromite (${{ matrix.target }})
+    needs: generate_build_deps
+    # run when: a new version was detected, OR build was manually requested
+    if: |
+      needs.generate_build_deps.outputs.new_version != '' ||
+      github.event.inputs.build == 'true'
+    runs-on: ${{ fromJSON(format('["ubuntu-latest", "{0}"]', github.event.inputs.type))[github.event.inputs.type != ''] }}
+    timeout-minutes: 350      # chromium builds take 3–6 h; stay under the 6 h limit
+
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: android
+            cpu: arm64
+            build_target: chrome_public_apk
+            artifact_glob: "out/Default/apks/*.apk"
+          - target: linux
+            cpu: x64
+            build_target: chrome
+            artifact_glob: "out/Default/chrome"
+
+    steps:
+      - name: Reclaim disk space
+        run: |
+          df -h
+          for DIR in \
+            /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+            /opt/hostedtoolcache/CodeQL /usr/local/.ghcup /usr/lib/jvm \
+            /usr/local/x86_64-linux-gnu /usr/local/gcc /usr/local/heroku \
+            /usr/share/swift /usr/share/miniconda /usr/local/share/powershell \
+            /usr/local/share/chromium /usr/lib/gcc; do
+            test -d "$DIR" && sudo rm -rf "$DIR" || true
+          done
+          for DIR in /usr/local/llvm-* /usr/lib/llvm-* /usr/local/julia* \
+                     /usr/share/az_*; do
+            sudo rm -rf $DIR 2>/dev/null || true
+          done
+          sudo apt-get remove -y \
+            google-cloud-cli azure-cli google-chrome-stable firefox \
+            mysql-server-core-8.0 mono-devel podman powershell || true
+          sudo apt-get autoremove -y
+          df -h
+
+      - name: Checkout repo
+        uses: actions/checkout@v4
+        with:
+          path: cromite
+          fetch-depth: 1
+
+      - name: Login to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Resolve build image
+        id: image
+        shell: bash
+        env:
+          CHR_VERSION: ${{ needs.generate_build_deps.outputs.chr_version }}
+        run: |
+          SHA=$(cd cromite && git rev-parse --short HEAD)
+          # cromite-build images are tagged VERSION-COMMITSHA per the release notes
+          IMAGE="uazo/cromite-build:${CHR_VERSION}-${SHA}"
+          # fall back to build-deps if a pre-built source image doesn't exist yet
+          docker pull "$IMAGE" 2>/dev/null \
+            || IMAGE="uazo/build-deps:${CHR_VERSION}"
+          echo "image=$IMAGE" >> $GITHUB_OUTPUT
+          echo "Resolved build image: $IMAGE"
+
+      - name: Run Cromite build — ${{ matrix.target }}/${{ matrix.cpu }}
+        shell: bash
+        timeout-minutes: 320
+        env:
+          BUILD_IMAGE: ${{ steps.image.outputs.image }}
+          CHR_VERSION: ${{ needs.generate_build_deps.outputs.chr_version }}
+        run: |
+          mkdir -p "${{ github.workspace }}/out"
+
+          docker run --rm \
+            -e WORKSPACE=/home/lg/working_dir \
+            -e TARGET_OS=${{ matrix.target }} \
+            -e TARGET_CPU=${{ matrix.cpu }} \
+            -e TARGET_ISDEBUG=false \
+            -e HTTP_PROXY="${PROXY_ADDR}" \
+            -v "${{ github.workspace }}/cromite:/home/lg/working_dir/cromite:ro" \
+            -v "${{ github.workspace }}/out:/home/lg/working_dir/chromium/src/out" \
+            "$BUILD_IMAGE" \
+            bash -exc '
+              export PATH=$WORKSPACE/chromium/src/third_party/llvm-build/Release+Asserts/bin:$WORKSPACE/depot_tools:/usr/local/go/bin:$WORKSPACE/mtool/bin:$PATH
+              export HOME=$WORKSPACE
+              cd $WORKSPACE/chromium/src
+
+              gn gen out/Default \
+                --args="$(cat $WORKSPACE/cromite/build/cromite.gn_args) \
+                        target_os="$TARGET_OS" \
+                        target_cpu="$TARGET_CPU""
+
+              autoninja -C out/Default ${{ matrix.build_target }}
+            '
+
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: cromite-${{ needs.generate_build_deps.outputs.chr_version }}-${{ matrix.target }}-${{ matrix.cpu }}
+          path: ${{ github.workspace }}/${{ matrix.artifact_glob }}
+          retention-days: 7
+          if-no-files-found: error
+
+      - name: Create draft GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ needs.generate_build_deps.outputs.chr_version }}
+          name: Cromite ${{ needs.generate_build_deps.outputs.chr_version }}
+          draft: true
+          prerelease: false
+          fail_on_unmatched_files: false
+          files: ${{ github.workspace }}/${{ matrix.artifact_glob }}
